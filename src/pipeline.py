@@ -8,7 +8,7 @@ from apify_client import ApifyClient, ApifySyncTimeoutError
 from blotato_client import BlotatoClient
 from config import ROOT_DIR, SETTINGS
 from content_generator import generate_content
-from notion_client import NotionClient
+from notion_client import NotionAPIError, NotionClient
 from utils import append_jsonl, sha256_text, utc_now_iso, write_json
 
 
@@ -44,38 +44,113 @@ def _notion_rich_text(value: str) -> Dict[str, Any]:
     return {"rich_text": [{"text": {"content": value[:1900]}}]}
 
 
+def _normalize(text: str) -> str:
+    return "".join(ch.lower() for ch in text if ch.isalnum())
+
+
+def _find_property_name(schema: Dict[str, Dict[str, Any]], aliases: List[str], prop_type: str) -> str:
+    normalized_aliases = [_normalize(a) for a in aliases]
+    for prop_name, conf in schema.items():
+        if conf.get("type") == prop_type and _normalize(prop_name) in normalized_aliases:
+            return prop_name
+    for prop_name, conf in schema.items():
+        if conf.get("type") == prop_type:
+            return prop_name
+    return ""
+
+
+def _title_prop(value: str) -> Dict[str, Any]:
+    return {"title": [{"text": {"content": value[:120]}}]}
+
+
+def _build_notion_properties(schema: Dict[str, Dict[str, Any]], values: Dict[str, str]) -> Dict[str, Any]:
+    properties: Dict[str, Any] = {}
+
+    title_name = _find_property_name(schema, ["name", "title", "nom"], "title")
+    if title_name:
+        title_value = values.get("title", "Untitled")
+        properties[title_name] = _title_prop(title_value)
+
+    for semantic_key, aliases in {
+        "type": ["type", "asset type", "content type", "format"],
+        "status": ["status", "statut"],
+        "cta_keyword": ["cta keyword", "keyword", "mot cle", "mot-clé"],
+    }.items():
+        value = values.get(semantic_key, "")
+        if not value:
+            continue
+        select_name = _find_property_name(schema, aliases, "select")
+        if select_name:
+            properties[select_name] = {"select": {"name": value[:100]}}
+
+    for semantic_key, aliases in {
+        "asset_title": ["asset title", "lead magnet title", "titre asset"],
+        "linkedin_post": ["linkedin post", "post", "post linkedin"],
+        "topic": ["topic", "angle", "sujet"],
+        "cta_keyword_text": ["cta keyword", "keyword", "mot cle", "mot-clé"],
+    }.items():
+        value = values.get(semantic_key, "")
+        if not value:
+            continue
+        rich_name = _find_property_name(schema, aliases, "rich_text")
+        if rich_name and rich_name not in properties:
+            properties[rich_name] = _notion_rich_text(value)
+
+    return properties
+
+
 def _create_notion_pages(notion: NotionClient, content: Dict[str, Any], linkedin_text: str) -> Dict[str, str]:
     if not notion.enabled or not SETTINGS.notion_lead_magnet_db_id or not SETTINGS.notion_runs_db_id:
         return {"asset_page_url": "", "run_page_url": ""}
 
     asset = content["asset"]
     asset_md = _build_asset_markdown(content)
-    asset_page = notion.create_page(
-        SETTINGS.notion_lead_magnet_db_id,
-        properties={
-            "Name": {"title": [{"text": {"content": asset["title"][:120]}}]},
-            "Type": {"select": {"name": asset["type"]}},
-            "CTA Keyword": _notion_rich_text(asset["cta_keyword"]),
-        },
-        children=[
+    try:
+        lead_schema = notion.get_database_properties(SETTINGS.notion_lead_magnet_db_id)
+        run_schema = notion.get_database_properties(SETTINGS.notion_runs_db_id)
+
+        lead_properties = _build_notion_properties(
+            lead_schema,
             {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {"rich_text": [{"type": "text", "text": {"content": asset_md[:1900]}}]},
-            }
-        ],
-    )
-    notion_run = notion.create_page(
-        SETTINGS.notion_runs_db_id,
-        properties={
-            "Name": {"title": [{"text": {"content": f"Run {datetime.utcnow().date().isoformat()}"}}]},
-            "Status": {"select": {"name": "published" if not SETTINGS.dry_run else "draft"}},
-            "Asset Title": _notion_rich_text(asset["title"]),
-            "LinkedIn Post": _notion_rich_text(linkedin_text),
-            "Topic": _notion_rich_text(content.get("metadata", {}).get("topic", "")),
-        },
-    )
-    return {"asset_page_url": asset_page.get("url", ""), "run_page_url": notion_run.get("url", "")}
+                "title": asset.get("title", "Lead Magnet"),
+                "type": asset.get("type", ""),
+                "cta_keyword": asset.get("cta_keyword", ""),
+                "cta_keyword_text": asset.get("cta_keyword", ""),
+            },
+        )
+
+        run_properties = _build_notion_properties(
+            run_schema,
+            {
+                "title": f"Run {datetime.utcnow().date().isoformat()}",
+                "status": "published" if not SETTINGS.dry_run else "draft",
+                "asset_title": asset.get("title", ""),
+                "linkedin_post": linkedin_text,
+                "topic": str(content.get("metadata", {}).get("topic", "")),
+            },
+        )
+
+        if not lead_properties or not run_properties:
+            raise NotionAPIError("No compatible Notion properties found in one of the target databases.")
+
+        asset_page = notion.create_page(
+            SETTINGS.notion_lead_magnet_db_id,
+            properties=lead_properties,
+            children=[
+                {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": asset_md[:1900]}}]},
+                }
+            ],
+        )
+        notion_run = notion.create_page(
+            SETTINGS.notion_runs_db_id,
+            properties=run_properties,
+        )
+        return {"asset_page_url": asset_page.get("url", ""), "run_page_url": notion_run.get("url", "")}
+    except Exception as exc:
+        return {"asset_page_url": "", "run_page_url": "", "error": str(exc)}
 
 
 def run_daily() -> Dict[str, Any]:
