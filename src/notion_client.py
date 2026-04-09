@@ -1,4 +1,6 @@
+import re
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -24,6 +26,26 @@ class NotionClient:
             "Notion-Version": self.notion_version,
             "Content-Type": "application/json",
         }
+
+    def _normalize_database_id(self, raw_database_id: str) -> str:
+        value = (raw_database_id or "").strip()
+        if not value:
+            return value
+
+        # If user pasted a full Notion URL, keep only path and remove query (?v=...).
+        if value.startswith("http://") or value.startswith("https://"):
+            parsed = urlparse(value)
+            value = parsed.path
+
+        # Extract UUID from either hyphenated or compact form.
+        match = re.search(r"([0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12})", value)
+        if match:
+            token = match.group(1).replace("-", "").lower()
+            return token
+
+        # Fallback: remove query/fragment if still present.
+        value = value.split("?", 1)[0].split("#", 1)[0]
+        return value.strip("/").lower()
 
     @retry(
         retry=retry_if_exception_type(httpx.HTTPError),
@@ -58,14 +80,16 @@ class NotionClient:
             return res.json()
 
     def get_database_properties(self, database_id: str) -> Dict[str, Dict[str, Any]]:
-        data = self._get(f"/databases/{database_id}")
+        normalized_id = self._normalize_database_id(database_id)
+        data = self._get(f"/databases/{normalized_id}")
         props = data.get("properties", {})
         if isinstance(props, dict):
             return props
         return {}
 
     def create_page(self, database_id: str, properties: Dict[str, Any], children: Optional[list] = None) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {"parent": {"database_id": database_id}, "properties": properties}
+        normalized_id = self._normalize_database_id(database_id)
+        payload: Dict[str, Any] = {"parent": {"database_id": normalized_id}, "properties": properties}
         if children:
             payload["children"] = children
         return self._post("/pages", payload)
